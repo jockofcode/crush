@@ -5,8 +5,10 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"maps"
+	"os"
 	"sync"
 	"time"
 
@@ -18,12 +20,14 @@ import (
 	"github.com/charmbracelet/crush/internal/history"
 	"github.com/charmbracelet/crush/internal/llm/agent"
 	"github.com/charmbracelet/crush/internal/log"
+	"github.com/charmbracelet/crush/internal/output"
 	"github.com/charmbracelet/crush/internal/pubsub"
 
 	"github.com/charmbracelet/crush/internal/lsp"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/permission"
 	"github.com/charmbracelet/crush/internal/session"
+	"github.com/charmbracelet/crush/internal/types"
 )
 
 type App struct {
@@ -186,6 +190,198 @@ func (app *App) RunNonInteractive(ctx context.Context, prompt string, quiet bool
 				part := msg.Content().String()[readBts:]
 				fmt.Print(part)
 				readBts += len(part)
+			}
+
+		case <-ctx.Done():
+			stopSpinner()
+			return ctx.Err()
+		}
+	}
+}
+
+// RunNonInteractiveWithCapture handles enhanced non-interactive execution with output capture
+func (app *App) RunNonInteractiveWithCapture(ctx context.Context, params types.NonInteractiveParams, quiet bool) error {
+	slog.Info("Running in enhanced non-interactive mode", "format", params.OutputFormat, "output_file", params.OutputFile)
+
+	// Create context with timeout if specified
+	if params.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, params.Timeout)
+		defer cancel()
+	}
+
+	// Start spinner if not in quiet mode
+	var spinner *format.Spinner
+	if !quiet {
+		spinner = format.NewSpinner(ctx, nil, "Generating")
+		spinner.Start()
+	}
+
+	// Helper function to stop spinner once
+	stopSpinner := func() {
+		if !quiet && spinner != nil {
+			spinner.Stop()
+			spinner = nil
+		}
+	}
+	defer stopSpinner()
+
+	// Create session with custom title or default
+	sessionTitle := params.SessionTitle
+	if sessionTitle == "" {
+		const maxPromptLengthForTitle = 100
+		titlePrefix := "Non-interactive: "
+		var titleSuffix string
+
+		if len(params.Prompt) > maxPromptLengthForTitle {
+			titleSuffix = params.Prompt[:maxPromptLengthForTitle] + "..."
+		} else {
+			titleSuffix = params.Prompt
+		}
+		sessionTitle = titlePrefix + titleSuffix
+	}
+
+	sess, err := app.Sessions.Create(ctx, sessionTitle)
+	if err != nil {
+		return fmt.Errorf("failed to create session for enhanced non-interactive mode: %w", err)
+	}
+	slog.Info("Created session for enhanced non-interactive run", "session_id", sess.ID, "title", sessionTitle)
+
+	// Set up output capture
+	var outputCapture output.OutputCapture
+	var outputWriter io.Writer
+	var outputFile *os.File
+
+	// Determine output writer
+	if params.OutputFile != "" {
+		outputFile, err = os.Create(params.OutputFile)
+		if err != nil {
+			return fmt.Errorf("failed to create output file %s: %w", params.OutputFile, err)
+		}
+		defer func() {
+			if outputFile != nil {
+				outputFile.Close()
+			}
+		}()
+		outputWriter = outputFile
+	} else {
+		outputWriter = os.Stdout
+	}
+
+	// Create appropriate output capture instance
+	if params.OutputFormat == output.FormatText && params.OutputFile == "" {
+		// For text format to stdout, use simple streaming
+		outputCapture = output.NewStreamingOutputCapture(outputWriter, 4096)
+	} else {
+		// For JSON/structured formats or file output, use buffered capture
+		outputCapture = output.NewOutputCapture()
+	}
+
+	// Start output capture
+	if err := outputCapture.StartCapture(sess.ID, params.OutputFormat); err != nil {
+		return fmt.Errorf("failed to start output capture: %w", err)
+	}
+	defer outputCapture.Close()
+
+	// Set session information for capture
+	if defaultCapture, ok := outputCapture.(*output.DefaultOutputCapture); ok {
+		defaultCapture.SetSession(&sess)
+	}
+
+	// Automatically approve all permission requests for this non-interactive session
+	app.Permissions.AutoApproveSession(sess.ID)
+
+	// TODO: Apply model override, max tokens, and disable tools
+	// This would require extending the agent.Service interface
+
+	// Start agent processing
+	done, err := app.CoderAgent.Run(ctx, sess.ID, params.Prompt)
+	if err != nil {
+		return fmt.Errorf("failed to start agent processing stream: %w", err)
+	}
+
+	messageEvents := app.Messages.Subscribe(ctx)
+	readBts := 0
+	startTime := time.Now()
+
+	for {
+		select {
+		case result := <-done:
+			stopSpinner()
+
+			if result.Error != nil {
+				if errors.Is(result.Error, context.Canceled) || errors.Is(result.Error, agent.ErrRequestCancelled) {
+					slog.Info("Enhanced non-interactive: agent processing cancelled", "session_id", sess.ID)
+					return nil
+				}
+				return fmt.Errorf("agent processing failed: %w", result.Error)
+			}
+
+			// Capture final message (except for text streaming to stdout)
+			if params.OutputFormat != output.FormatText || params.OutputFile != "" {
+				if err := outputCapture.CaptureMessage(&result.Message); err != nil {
+					slog.Warn("Failed to capture final message", "error", err)
+				}
+			}
+
+			// Capture metadata
+			endTime := time.Now()
+			metadata := output.ConversationMetadata{
+				SessionID:  sess.ID,
+				StartTime:  startTime,
+				EndTime:    endTime,
+				DurationMs: endTime.Sub(startTime).Milliseconds(),
+				Model:      result.Message.Model,
+				Provider:   result.Message.Provider,
+			}
+
+			if err := outputCapture.CaptureMetadata(metadata); err != nil {
+				slog.Warn("Failed to capture metadata", "error", err)
+			}
+
+			// Handle output based on format and destination
+			if params.OutputFormat == output.FormatText && params.OutputFile == "" {
+				// For text to stdout, content was already streamed, no additional output needed
+				// The readBts tracking ensures we don't double-print content
+			} else {
+				// For other formats, write the captured output
+				if err := outputCapture.WriteOutput(outputWriter); err != nil {
+					return fmt.Errorf("failed to write output: %w", err)
+				}
+			}
+
+			slog.Info("Enhanced non-interactive: run completed", "session_id", sess.ID, "duration_ms", metadata.DurationMs)
+			return nil
+
+		case event := <-messageEvents:
+			msg := event.Payload
+			if msg.SessionID == sess.ID {
+				// For all output formats (except text streaming to stdout), only capture user messages
+				// and avoid capturing incremental assistant message updates. The final assistant 
+				// message is captured in the done case above.
+				shouldCapture := true
+				if params.OutputFile != "" || params.OutputFormat == output.FormatJSON || params.OutputFormat == output.FormatStructured {
+					// For all file outputs and structured formats, only capture user messages
+					// Final assistant message is captured in done case
+					shouldCapture = (msg.Role == message.User)
+				} else if params.OutputFormat == output.FormatText && params.OutputFile == "" {
+					// For text streaming to stdout, don't capture anything - content is streamed directly
+					shouldCapture = false
+				}
+				
+				if shouldCapture {
+					if err := outputCapture.CaptureMessage(&msg); err != nil {
+						slog.Warn("Failed to capture message", "error", err)
+					}
+				}
+
+				// For text format to stdout, stream assistant messages immediately
+				if msg.Role == message.Assistant && len(msg.Parts) > 0 && params.OutputFormat == output.FormatText && params.OutputFile == "" {
+					stopSpinner()
+					part := msg.Content().String()[readBts:]
+					fmt.Print(part)
+					readBts += len(part)
+				}
 			}
 
 		case <-ctx.Done():
