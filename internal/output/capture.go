@@ -1,10 +1,13 @@
 package output
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,6 +22,11 @@ const (
 	FormatText       OutputFormat = "text"
 	FormatJSON       OutputFormat = "json"
 	FormatStructured OutputFormat = "structured"
+)
+
+var (
+	thinkingTagRegex = regexp.MustCompile(`(?is)<think\b[^>]*>.*?</think>`)
+	whitespaceRegex  = regexp.MustCompile(`\n\s*\n`)
 )
 
 // ConversationMetadata contains metadata about the conversation
@@ -65,17 +73,79 @@ type DefaultOutputCapture struct {
 	session   *session.Session
 	toolCalls []interface{}
 	
-	started   bool
-	closed    bool
-	startTime time.Time
+	started         bool
+	closed          bool
+	startTime       time.Time
+	filterReasoning bool    // NEW: Add this field exactly here
 }
 
 // NewOutputCapture creates a new output capture instance
-func NewOutputCapture() OutputCapture {
+func NewOutputCapture(filterReasoning bool) OutputCapture {
 	return &DefaultOutputCapture{
-		messages:  make([]*message.Message, 0),
-		toolCalls: make([]interface{}, 0),
+		messages:        make([]*message.Message, 0),
+		toolCalls:       make([]interface{}, 0),
+		filterReasoning: filterReasoning,  // NEW: Add exactly here
 	}
+}
+
+// filterThinkingContent removes thinking tags from content with security controls
+func filterThinkingContent(content string) string {
+	// Content size limit: 1MB
+	if len(content) > 1024*1024 {
+		return content // Skip filtering for large content
+	}
+	
+	// Check if content is valid for processing
+	if !isValidThinkingContent(content) {
+		return content // Skip filtering for invalid content
+	}
+	
+	// Use channel-based goroutine pattern with timeout protection
+	result := make(chan string, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	
+	go func() {
+		// Apply regex filtering
+		filtered := thinkingTagRegex.ReplaceAllString(content, "")
+		// Clean up whitespace
+		cleaned := cleanWhitespace(filtered)
+		result <- cleaned
+	}()
+	
+	select {
+	case filtered := <-result:
+		return filtered
+	case <-ctx.Done():
+		// Timeout protection: return original content
+		return content
+	}
+}
+
+// isValidThinkingContent validates content for safe processing
+func isValidThinkingContent(content string) bool {
+	// Balance check: openCount == closeCount
+	openCount := strings.Count(content, "<think")
+	closeCount := strings.Count(content, "</think>")
+	
+	if openCount != closeCount {
+		return false // Unbalanced tags
+	}
+	
+	// Limit check: <= 100 tags
+	if openCount > 100 {
+		return false // Too many tags
+	}
+	
+	return true
+}
+
+// cleanWhitespace removes excessive whitespace from content
+func cleanWhitespace(content string) string {
+	// Use whitespaceRegex to replace multiple newlines with single newline
+	cleaned := whitespaceRegex.ReplaceAllString(content, "\n")
+	// Apply strings.TrimSpace
+	return strings.TrimSpace(cleaned)
 }
 
 // StartCapture initializes the output capture
@@ -195,7 +265,14 @@ func (oc *DefaultOutputCapture) GetContent() string {
 	content := ""
 	for _, msg := range oc.messages {
 		if msg.Role == message.Assistant {
-			content += msg.Content().String()
+			msgContent := msg.Content().String()
+			
+			// Apply filtering if enabled for assistant messages
+			if oc.filterReasoning && msg.Role == message.Assistant {
+				msgContent = filterThinkingContent(msgContent)
+			}
+			
+			content += msgContent
 		}
 	}
 	return content
@@ -206,6 +283,12 @@ func (oc *DefaultOutputCapture) writeTextOutput(writer io.Writer) error {
 	for _, msg := range oc.messages {
 		if msg.Role == message.Assistant {
 			content := msg.Content().String()
+			
+			// Apply filtering if enabled for assistant messages
+			if oc.filterReasoning && msg.Role == message.Assistant {
+				content = filterThinkingContent(content)
+			}
+			
 			if _, err := writer.Write([]byte(content)); err != nil {
 				return fmt.Errorf("failed to write text output: %w", err)
 			}
@@ -216,9 +299,35 @@ func (oc *DefaultOutputCapture) writeTextOutput(writer io.Writer) error {
 
 // writeJSONOutput writes JSON formatted output
 func (oc *DefaultOutputCapture) writeJSONOutput(writer io.Writer) error {
+	// Create messages slice with filtering applied if enabled
+	messages := oc.messages
+	if oc.filterReasoning {
+		messages = make([]*message.Message, len(oc.messages))
+		for i, msg := range oc.messages {
+			// Deep copy message
+			msgCopy := *msg
+			messages[i] = &msgCopy
+			
+			// Apply filtering if enabled for assistant messages
+			if msg.Role == message.Assistant {
+				// Get original content and filter it
+				originalContent := msg.Content().String()
+				filteredContent := filterThinkingContent(originalContent)
+				
+				// Update message content parts with filtered content
+				if filteredContent != originalContent {
+					// Create new text content part with filtered content
+					msgCopy.Parts = []message.ContentPart{
+						message.TextContent{Text: filteredContent},
+					}
+				}
+			}
+		}
+	}
+	
 	output := ConversationOutput{
 		SessionID:   oc.sessionID,
-		Messages:    oc.messages,
+		Messages:    messages,
 		Metadata:    oc.metadata,
 		SessionInfo: oc.session,
 		ToolCalls:   oc.toolCalls,

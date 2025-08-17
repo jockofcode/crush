@@ -201,7 +201,7 @@ func (app *App) RunNonInteractive(ctx context.Context, prompt string, quiet bool
 
 // RunNonInteractiveWithCapture handles enhanced non-interactive execution with output capture
 func (app *App) RunNonInteractiveWithCapture(ctx context.Context, params types.NonInteractiveParams, quiet bool) error {
-	slog.Info("Running in enhanced non-interactive mode", "format", params.OutputFormat, "output_file", params.OutputFile)
+	slog.Info("Running in enhanced non-interactive mode", "format", params.OutputFormat, "output_file", params.OutputFile, "filter_reasoning", params.FilterReasoning)
 
 	// Create context with timeout if specified
 	if params.Timeout > 0 {
@@ -269,12 +269,12 @@ func (app *App) RunNonInteractiveWithCapture(ctx context.Context, params types.N
 	}
 
 	// Create appropriate output capture instance
-	if params.OutputFormat == output.FormatText && params.OutputFile == "" {
-		// For text format to stdout, use simple streaming
+	if params.OutputFormat == output.FormatText && params.OutputFile == "" && !params.FilterReasoning {
+		// For text format to stdout WITHOUT filtering, use simple streaming
 		outputCapture = output.NewStreamingOutputCapture(outputWriter, 4096)
 	} else {
-		// For JSON/structured formats or file output, use buffered capture
-		outputCapture = output.NewOutputCapture()
+		// For JSON/structured formats, file output, OR when filtering is requested, use buffered capture
+		outputCapture = output.NewOutputCapture(params.FilterReasoning)
 	}
 
 	// Start output capture
@@ -317,8 +317,8 @@ func (app *App) RunNonInteractiveWithCapture(ctx context.Context, params types.N
 				return fmt.Errorf("agent processing failed: %w", result.Error)
 			}
 
-			// Capture final message (except for text streaming to stdout)
-			if params.OutputFormat != output.FormatText || params.OutputFile != "" {
+			// Capture final message (except for text streaming to stdout without filtering)
+			if params.OutputFormat != output.FormatText || params.OutputFile != "" || params.FilterReasoning {
 				if err := outputCapture.CaptureMessage(&result.Message); err != nil {
 					slog.Warn("Failed to capture final message", "error", err)
 				}
@@ -340,11 +340,12 @@ func (app *App) RunNonInteractiveWithCapture(ctx context.Context, params types.N
 			}
 
 			// Handle output based on format and destination
-			if params.OutputFormat == output.FormatText && params.OutputFile == "" {
-				// For text to stdout, content was already streamed, no additional output needed
+			if params.OutputFormat == output.FormatText && params.OutputFile == "" && !params.FilterReasoning {
+				// For text to stdout WITHOUT filtering, content was already streamed, no additional output needed
 				// The readBts tracking ensures we don't double-print content
 			} else {
-				// For other formats, write the captured output
+				// For other formats, file output, OR when filtering is requested, write the captured output
+				slog.Info("DEBUG: Taking WriteOutput path", "FilterReasoning", params.FilterReasoning)
 				if err := outputCapture.WriteOutput(outputWriter); err != nil {
 					return fmt.Errorf("failed to write output: %w", err)
 				}
@@ -360,11 +361,11 @@ func (app *App) RunNonInteractiveWithCapture(ctx context.Context, params types.N
 				// and avoid capturing incremental assistant message updates. The final assistant 
 				// message is captured in the done case above.
 				shouldCapture := true
-				if params.OutputFile != "" || params.OutputFormat == output.FormatJSON || params.OutputFormat == output.FormatStructured {
-					// For all file outputs and structured formats, only capture user messages
+				if params.OutputFile != "" || params.OutputFormat == output.FormatJSON || params.OutputFormat == output.FormatStructured || params.FilterReasoning {
+					// For all file outputs, structured formats, OR filtering, only capture user messages
 					// Final assistant message is captured in done case
 					shouldCapture = (msg.Role == message.User)
-				} else if params.OutputFormat == output.FormatText && params.OutputFile == "" {
+				} else if params.OutputFormat == output.FormatText && params.OutputFile == "" && !params.FilterReasoning {
 					// For text streaming to stdout, don't capture anything - content is streamed directly
 					shouldCapture = false
 				}
@@ -375,8 +376,8 @@ func (app *App) RunNonInteractiveWithCapture(ctx context.Context, params types.N
 					}
 				}
 
-				// For text format to stdout, stream assistant messages immediately
-				if msg.Role == message.Assistant && len(msg.Parts) > 0 && params.OutputFormat == output.FormatText && params.OutputFile == "" {
+				// For text format to stdout WITHOUT filtering, stream assistant messages immediately
+				if msg.Role == message.Assistant && len(msg.Parts) > 0 && params.OutputFormat == output.FormatText && params.OutputFile == "" && !params.FilterReasoning {
 					stopSpinner()
 					part := msg.Content().String()[readBts:]
 					fmt.Print(part)
