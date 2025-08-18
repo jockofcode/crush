@@ -20,9 +20,8 @@ var runCmd = &cobra.Command{
 The prompt can be provided as arguments, via flags, from files, or piped from stdin.
 Output can be captured in multiple formats for automation and scripting.
 
-The --no-reasoning flag can be used to remove AI reasoning content 
-(content within <think>...</think> tags) from the output. This is
-useful for automation and when you only need the final response.`,
+By default, AI reasoning content (<think>...</think> tags) is filtered from output.
+Use --show-reasoning to display reasoning content.`,
 	Example: `
 # Run a simple prompt
 crush run Explain the use of context in Go
@@ -51,10 +50,12 @@ echo "What is this code doing?" | crush run
 # Run with quiet mode (no spinner)
 crush run -q "Generate a README for this project"
 
-# Remove reasoning content from output
-crush run "explain this code" --no-reasoning
-crush run "write a function" --output result.txt --no-reasoning
-crush run "analyze logs" --format json --no-reasoning
+# Default behavior (reasoning filtered)
+crush run "explain this code"
+
+# Show reasoning content
+crush run "write a function" --show-reasoning --output result.txt
+crush run "analyze logs" --format json --show-reasoning
   `,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		// Get flag values
@@ -69,11 +70,28 @@ crush run "analyze logs" --format json --no-reasoning
 		noTools, _ := cmd.Flags().GetBool("no-tools")
 		sessionTitle, _ := cmd.Flags().GetString("session-title")
 		
+		// Enhanced flag parsing with security validation and compatibility
+		showReasoning, err := cmd.Flags().GetBool("show-reasoning")
+		if err != nil {
+			return fmt.Errorf("failed to get show-reasoning flag: %w", err)
+		}
+
+		// Handle deprecated flag with validation
 		noReasoning, err := cmd.Flags().GetBool("no-reasoning")
 		if err != nil {
 			return fmt.Errorf("failed to get no-reasoning flag: %w", err)
 		}
-		slog.Info("CLI flag parsing", "no-reasoning", noReasoning)
+
+		// Validate mutual exclusion and handle deprecation
+		if cmd.Flags().Changed("no-reasoning") {
+			if cmd.Flags().Changed("show-reasoning") {
+				return fmt.Errorf("cannot use both --no-reasoning and --show-reasoning flags")
+			}
+			slog.Warn("--no-reasoning flag is deprecated, use --show-reasoning instead")
+			showReasoning = !noReasoning // Invert deprecated flag behavior
+		}
+
+		slog.Info("CLI flag parsing", "show-reasoning", showReasoning)
 
 		// Fast validation of parameters BEFORE expensive app setup
 		var format output.OutputFormat
@@ -182,7 +200,7 @@ crush run "analyze logs" --format json --no-reasoning
 			DisableTools:    noTools,
 			OutputFormat:    format,
 			OutputFile:      outputFile,
-			FilterReasoning: noReasoning,    // NEW
+			FilterReasoning: !showReasoning,    // Invert: filter by default, show only when requested
 		}
 
 		// Try to use the enhanced method (implemented in this enhancement)
@@ -201,7 +219,9 @@ func init() {
 	// Output control flags
 	runCmd.Flags().StringP("output", "o", "", "Output file path (default: stdout)")
 	runCmd.Flags().String("format", "text", "Output format: text, json, structured")
-	runCmd.Flags().Bool("no-reasoning", false, "Remove AI reasoning content from output")
+	runCmd.Flags().Bool("show-reasoning", false, "Show AI reasoning content in output (disabled by default)")
+	runCmd.Flags().Bool("no-reasoning", false, "DEPRECATED: Use --show-reasoning instead")
+	runCmd.Flags().MarkDeprecated("no-reasoning", "use --show-reasoning flag instead")
 	
 	// Execution control flags
 	runCmd.Flags().Int("timeout", 0, "Response timeout in seconds (0 = no timeout)")

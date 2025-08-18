@@ -13,6 +13,7 @@ import (
 
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/session"
+	"github.com/charmbracelet/crush/internal/security"
 )
 
 // OutputFormat represents the format for output capture
@@ -76,7 +77,11 @@ type DefaultOutputCapture struct {
 	started         bool
 	closed          bool
 	startTime       time.Time
-	filterReasoning bool    // NEW: Add this field exactly here
+	filterReasoning bool    // true = filter reasoning (DEFAULT), false = show reasoning
+	
+	// Security controls
+	validator *security.InputValidator
+	auditor   *security.SecurityAuditor
 }
 
 // NewOutputCapture creates a new output capture instance
@@ -84,21 +89,53 @@ func NewOutputCapture(filterReasoning bool) OutputCapture {
 	return &DefaultOutputCapture{
 		messages:        make([]*message.Message, 0),
 		toolCalls:       make([]interface{}, 0),
-		filterReasoning: filterReasoning,  // NEW: Add exactly here
+		filterReasoning: filterReasoning,
 	}
 }
 
+// NewOutputCaptureSecure creates a new output capture instance with security controls
+func NewOutputCaptureSecure(filterReasoning bool, validator *security.InputValidator, auditor *security.SecurityAuditor) OutputCapture {
+	oc := &DefaultOutputCapture{
+		messages:        make([]*message.Message, 0),
+		toolCalls:       make([]interface{}, 0),
+		filterReasoning: filterReasoning,
+		validator:       validator,
+		auditor:         auditor,
+	}
+	
+	// Log output capture initialization
+	if auditor != nil {
+		auditor.LogSecurityEvent("output_capture_init", map[string]interface{}{
+			"filter_reasoning": filterReasoning,
+		})
+	}
+	
+	return oc
+}
+
 // filterThinkingContent removes thinking tags from content with security controls
-func filterThinkingContent(content string) string {
-	// Content size limit: 1MB
-	if len(content) > 1024*1024 {
-		return content // Skip filtering for large content
+func (oc *DefaultOutputCapture) filterThinkingContent(content string) string {
+	if !oc.filterReasoning {
+		return content
+	}
+	
+	// Security size check before processing
+	if len(content) > 1024*1024 { // 1MB limit from existing security controls
+		if oc.auditor != nil {
+			oc.auditor.LogSecurityEvent("content_size_limit", map[string]interface{}{
+				"content_size": len(content),
+			})
+		}
+		return content // Return original if too large
 	}
 	
 	// Check if content is valid for processing
 	if !isValidThinkingContent(content) {
 		return content // Skip filtering for invalid content
 	}
+	
+	// Apply existing filtering logic with timeout protection
+	startTime := time.Now()
 	
 	// Use channel-based goroutine pattern with timeout protection
 	result := make(chan string, 1)
@@ -115,9 +152,23 @@ func filterThinkingContent(content string) string {
 	
 	select {
 	case filtered := <-result:
+		duration := time.Since(startTime)
+		
+		// Log if processing takes too long (existing 100ms timeout)
+		if duration > 100*time.Millisecond && oc.auditor != nil {
+			oc.auditor.LogSecurityEvent("processing_timeout", map[string]interface{}{
+				"duration_ms": duration.Milliseconds(),
+			})
+		}
+		
 		return filtered
 	case <-ctx.Done():
 		// Timeout protection: return original content
+		if oc.auditor != nil {
+			oc.auditor.LogSecurityEvent("processing_timeout", map[string]interface{}{
+				"duration_ms": 100,
+			})
+		}
 		return content
 	}
 }
@@ -269,7 +320,7 @@ func (oc *DefaultOutputCapture) GetContent() string {
 			
 			// Apply filtering if enabled for assistant messages
 			if oc.filterReasoning && msg.Role == message.Assistant {
-				msgContent = filterThinkingContent(msgContent)
+				msgContent = oc.filterThinkingContent(msgContent)
 			}
 			
 			content += msgContent
@@ -286,7 +337,7 @@ func (oc *DefaultOutputCapture) writeTextOutput(writer io.Writer) error {
 			
 			// Apply filtering if enabled for assistant messages
 			if oc.filterReasoning && msg.Role == message.Assistant {
-				content = filterThinkingContent(content)
+				content = oc.filterThinkingContent(content)
 			}
 			
 			if _, err := writer.Write([]byte(content)); err != nil {
@@ -312,7 +363,7 @@ func (oc *DefaultOutputCapture) writeJSONOutput(writer io.Writer) error {
 			if msg.Role == message.Assistant {
 				// Get original content and filter it
 				originalContent := msg.Content().String()
-				filteredContent := filterThinkingContent(originalContent)
+				filteredContent := oc.filterThinkingContent(originalContent)
 				
 				// Update message content parts with filtered content
 				if filteredContent != originalContent {

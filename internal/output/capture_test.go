@@ -6,8 +6,10 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"log/slog"
 
 	"github.com/charmbracelet/crush/internal/message"
+	"github.com/charmbracelet/crush/internal/security"
 )
 
 func TestDefaultOutputCapture_StartCapture(t *testing.T) {
@@ -335,7 +337,9 @@ func TestFilterThinkingContent(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := filterThinkingContent(tt.input)
+			// Create a capture instance with filtering enabled
+			capture := NewOutputCapture(true).(*DefaultOutputCapture)
+			result := capture.filterThinkingContent(tt.input)
 			if result != tt.expected {
 				t.Errorf("filterThinkingContent() = %q, expected %q", result, tt.expected)
 			}
@@ -368,8 +372,9 @@ func TestFilterThinkingContentSecurity(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			capture := NewOutputCapture(true).(*DefaultOutputCapture)
 			start := time.Now()
-			result := filterThinkingContent(tt.input)
+			result := capture.filterThinkingContent(tt.input)
 			duration := time.Since(start)
 
 			if duration > 200*time.Millisecond {
@@ -435,8 +440,9 @@ func TestReDoSProtection(t *testing.T) {
 	// Test nested tag content that could cause ReDoS
 	maliciousContent := strings.Repeat("<think><think>", 1000) + "content"
 	
+	capture := NewOutputCapture(true).(*DefaultOutputCapture)
 	start := time.Now()
-	result := filterThinkingContent(maliciousContent)
+	result := capture.filterThinkingContent(maliciousContent)
 	duration := time.Since(start)
 	
 	if duration > 200*time.Millisecond {
@@ -453,8 +459,9 @@ func TestSizeLimitProtection(t *testing.T) {
 	// Create content larger than 1MB
 	largeContent := strings.Repeat("x", 1024*1024+1)
 	
+	capture := NewOutputCapture(true).(*DefaultOutputCapture)
 	start := time.Now()
-	result := filterThinkingContent(largeContent)
+	result := capture.filterThinkingContent(largeContent)
 	duration := time.Since(start)
 	
 	if duration > 10*time.Millisecond {
@@ -471,8 +478,9 @@ func TestTimeoutProtection(t *testing.T) {
 	// Create content that might trigger timeout
 	complexContent := strings.Repeat("<think>", 200) + "content" + strings.Repeat("</think>", 200)
 	
+	capture := NewOutputCapture(true).(*DefaultOutputCapture)
 	start := time.Now()
-	result := filterThinkingContent(complexContent)
+	result := capture.filterThinkingContent(complexContent)
 	duration := time.Since(start)
 	
 	// Should complete within reasonable time
@@ -490,8 +498,9 @@ func TestTagCountLimitProtection(t *testing.T) {
 	// Create content with excessive tag count (>100)
 	excessiveContent := strings.Repeat("<think>x</think>", 101)
 	
+	capture := NewOutputCapture(true).(*DefaultOutputCapture)
 	start := time.Now()
-	result := filterThinkingContent(excessiveContent)
+	result := capture.filterThinkingContent(excessiveContent)
 	duration := time.Since(start)
 	
 	if duration > 10*time.Millisecond {
@@ -506,20 +515,22 @@ func TestTagCountLimitProtection(t *testing.T) {
 
 func BenchmarkFilteringPerformance(b *testing.B) {
 	content := strings.Repeat("Text <think>reasoning content</think> more text.\n", 500) // ~10KB
+	capture := NewOutputCapture(true).(*DefaultOutputCapture)
 	
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		filtered := filterThinkingContent(content)
+		filtered := capture.filterThinkingContent(content)
 		_ = filtered
 	}
 }
 
 func BenchmarkSecurityControlOverhead(b *testing.B) {
 	content := "Simple content without thinking tags"
+	capture := NewOutputCapture(true).(*DefaultOutputCapture)
 	
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		filtered := filterThinkingContent(content)
+		filtered := capture.filterThinkingContent(content)
 		_ = filtered
 	}
 }
@@ -559,10 +570,11 @@ func BenchmarkCleanWhitespace(b *testing.B) {
 func BenchmarkFilteringWithMultipleTags(b *testing.B) {
 	// Create content with multiple thinking tags
 	content := strings.Repeat("Before <think>reasoning</think> middle <think>more reasoning</think> after.\n", 100)
+	capture := NewOutputCapture(true).(*DefaultOutputCapture)
 	
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		filtered := filterThinkingContent(content)
+		filtered := capture.filterThinkingContent(content)
 		_ = filtered
 	}
 }
@@ -610,7 +622,8 @@ func TestPerformanceTargets(t *testing.T) {
 			
 			switch tt.name {
 			case "filtering_10kb_content", "security_control_simple":
-				_ = filterThinkingContent(tt.content)
+				capture := NewOutputCapture(true).(*DefaultOutputCapture)
+				_ = capture.filterThinkingContent(tt.content)
 			case "size_validation_10kb":
 				_ = isValidThinkingContent(tt.content)
 			}
@@ -879,5 +892,103 @@ func TestGetContentWithFiltering(t *testing.T) {
 				t.Errorf("GetContent() = %q, expected %q", content, tt.expected)
 			}
 		})
+	}
+}
+
+// Test output capture security controls
+func TestOutputCaptureSecurityControls(t *testing.T) {
+	config := security.DefaultSecurityConfig()
+	validator, err := security.NewInputValidator(&config.Input, nil)
+	if err != nil {
+		t.Fatalf("Failed to create validator: %v", err)
+	}
+	auditor := security.NewSecurityAuditor(&config.AuditLog, slog.Default())
+	
+	tests := []struct {
+		name           string
+		content        string
+		expectFiltered bool
+		expectError    bool
+	}{
+		{
+			name:           "normal content",
+			content:        "This is normal output content",
+			expectFiltered: false,
+			expectError:    false,
+		},
+		{
+			name:           "content with reasoning tags",
+			content:        "Output with <think>reasoning content</think> included",
+			expectFiltered: true,
+			expectError:    false,
+		},
+		{
+			name:           "oversized content",
+			content:        strings.Repeat("A", 2*1024*1024), // 2MB
+			expectFiltered: false, // Should return original due to size limit
+			expectError:    false,
+		},
+	}
+	
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			oc := NewOutputCaptureSecure(true, validator, auditor).(*DefaultOutputCapture) // filtering enabled
+			
+			result := oc.filterThinkingContent(tt.content)
+			
+			if tt.expectFiltered {
+				if result == tt.content {
+					t.Errorf("Content should be filtered but was not")
+				}
+				if strings.Contains(result, "<think>") {
+					t.Errorf("Thinking tags should be removed")
+				}
+			} else {
+				if len(tt.content) <= 1024*1024 { // Only test equality for reasonable size content
+					if result != tt.content {
+						t.Errorf("Content should not be modified")
+					}
+				}
+			}
+		})
+	}
+}
+
+// Test security auditor integration
+func TestSecurityAuditorIntegration(t *testing.T) {
+	config := security.DefaultSecurityConfig()
+	validator, err := security.NewInputValidator(&config.Input, nil)
+	if err != nil {
+		t.Fatalf("Failed to create validator: %v", err)
+	}
+	auditor := security.NewSecurityAuditor(&config.AuditLog, slog.Default())
+	
+	// Create secure output capture
+	oc := NewOutputCaptureSecure(true, validator, auditor)
+	
+	// Start capture and add a message
+	err = oc.StartCapture("test-session", FormatText)
+	if err != nil {
+		t.Fatalf("StartCapture failed: %v", err)
+	}
+	
+	testMessage := &message.Message{
+		ID:        "msg-1",
+		SessionID: "test-session",
+		Role:      message.Assistant,
+		Parts: []message.ContentPart{
+			message.TextContent{Text: "Test content with <think>reasoning</think> tags"},
+		},
+	}
+	
+	err = oc.CaptureMessage(testMessage)
+	if err != nil {
+		t.Fatalf("CaptureMessage failed: %v", err)
+	}
+	
+	// Verify that security events were logged
+	stats := auditor.GetStats()
+	if stats.TotalEvents == 0 {
+		t.Errorf("Should have logged security events but got %d", stats.TotalEvents)
 	}
 }

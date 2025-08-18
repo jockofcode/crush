@@ -3,6 +3,7 @@ package messages
 import (
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -30,6 +31,9 @@ var CopyKey = key.NewBinding(key.WithKeys("c", "y", "C", "Y"), key.WithHelp("c/y
 
 // ClearSelectionKey is the key binding for clearing the current selection in the chat interface.
 var ClearSelectionKey = key.NewBinding(key.WithKeys("esc"), key.WithHelp("esc", "clear selection"))
+
+// thinkingTagRegex matches <think>...</think> tags for reasoning content filtering
+var thinkingTagRegex = regexp.MustCompile(`(?is)<think\b[^>]*>.*?</think>`)
 
 // MessageCmp defines the interface for message components in the chat interface.
 // It combines standard UI model interfaces with message-specific functionality.
@@ -178,6 +182,11 @@ func (m *messageCmp) renderAssistantMessage() string {
 	t := styles.CurrentTheme()
 	parts := []string{}
 	content := m.message.Content().String()
+	
+	// Filter reasoning content from main message content in REPL mode
+	content = thinkingTagRegex.ReplaceAllString(content, "")
+	content = strings.TrimSpace(content)
+	
 	thinking := m.message.IsThinking()
 	finished := m.message.IsFinished()
 	finishedData := m.message.FinishPart()

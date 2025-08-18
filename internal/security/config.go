@@ -101,12 +101,12 @@ func DefaultSecurityConfig() *SecurityConfig {
 			MaxLines:           10000,
 			AllowedCharPattern: `[\p{L}\p{N}\p{P}\p{S}\p{Z}\s\n\r\t]`,
 			BlockedPatterns: []string{
-				`\$\(.*\)`,           // Command substitution
+				`\$\(.*\)`,           // Command substitution  
 				`\x00`,               // Null bytes
-				`\x0[1-8]`,           // Control characters
-				`\x0[e-f]`,           // More control characters
-				`\x1[0-9a-f]`,        // More control characters
-				`<script.*?>.*?</script>`, // Script tags
+				`[\x01-\x08]`,        // Control characters 1-8
+				`[\x0e-\x0f]`,        // Control characters e-f
+				`[\x10-\x1f]`,        // Control characters 10-1f
+				`<script.*>.*</script>`, // Script tags
 				`javascript:`,        // JavaScript URLs
 				`vbscript:`,         // VBScript URLs
 			},
